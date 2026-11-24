@@ -11,6 +11,7 @@ import os
 import sys
 import unittest
 from unittest import mock
+import hashlib
 
 import time
 import logging
@@ -19,7 +20,72 @@ import tempfile
 from os.path import join
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from gallery_dl import config, extractor  # noqa E402
+from gallery_dl import aes, config, cookies, extractor  # noqa E402
+
+
+class TestMacChromiumCookieDecryptor(unittest.TestCase):
+
+    password = b"synthetic-test-keychain-password"
+    iv = b" " * 16
+
+    def _encrypted_cookie(self, version, value):
+        salt = b"saltysalt" if version == b"v10" else b"pepper"
+        key = hashlib.pbkdf2_hmac("sha1", self.password, salt, 1003, 16)
+        ciphertext = aes.aes_cbc_encrypt(
+            list(value), list(key), list(self.iv))
+        return version + bytes(ciphertext)
+
+    def _decryptor(self, meta_version=0):
+        keychain = mock.patch.object(
+            cookies, "_get_mac_keyring_password",
+            return_value=self.password)
+        keychain.start()
+        self.addCleanup(keychain.stop)
+        return cookies.MacChromiumCookieDecryptor(
+            "Synthetic Test Browser", meta_version)
+
+    def test_decrypt_v10_cookie(self):
+        decryptor = self._decryptor()
+        encrypted = self._encrypted_cookie(b"v10", b"synthetic-v10-value")
+
+        self.assertEqual(decryptor.decrypt(encrypted), "synthetic-v10-value")
+        self.assertEqual(decryptor.cookie_counts["v10"], 1)
+        self.assertEqual(decryptor.cookie_counts["other"], 0)
+
+    def test_decrypt_v11_cookie(self):
+        decryptor = self._decryptor()
+        encrypted = self._encrypted_cookie(b"v11", b"synthetic-v11-value")
+
+        self.assertEqual(decryptor.decrypt(encrypted), "synthetic-v11-value")
+        self.assertEqual(decryptor.cookie_counts, {
+            "v10": 0, "v11": 1, "other": 0,
+        })
+
+    def test_v11_cookie_without_keychain_password(self):
+        failed_security = mock.Mock(returncode=44)
+        with mock.patch.object(
+                cookies, "Popen_communicate",
+                return_value=(failed_security, b"")):
+            decryptor = cookies.MacChromiumCookieDecryptor(
+                "Synthetic Test Browser")
+
+        encrypted = self._encrypted_cookie(b"v11", b"synthetic-v11-value")
+        self.assertIsNone(decryptor.decrypt(encrypted))
+        self.assertEqual(decryptor.cookie_counts["v11"], 1)
+
+    def test_truncated_v11_cookie(self):
+        decryptor = self._decryptor()
+        self.assertIsNone(decryptor.decrypt(b"v11"))
+        self.assertIsNone(decryptor.decrypt(b"v11short"))
+
+    def test_meta_version_24_strips_sha256_hostname_prefix(self):
+        host_hash = hashlib.sha256(b"example.org").digest()
+        decryptor = self._decryptor(meta_version=24)
+        encrypted = self._encrypted_cookie(
+            b"v11", host_hash + b"synthetic-prefixed-value")
+
+        self.assertEqual(
+            decryptor.decrypt(encrypted), "synthetic-prefixed-value")
 
 
 class TestCookiejar(unittest.TestCase):

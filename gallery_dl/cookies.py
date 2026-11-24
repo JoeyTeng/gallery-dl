@@ -597,7 +597,13 @@ class MacChromiumCookieDecryptor(ChromiumCookieDecryptor):
     def __init__(self, browser_keyring_name, meta_version=0):
         password = _get_mac_keyring_password(browser_keyring_name)
         self._v10_key = None if password is None else self.derive_key(password)
-        self._cookie_counts = {"v10": 0, "other": 0}
+        # Chromium 158 uses a separate salt for custom user data directories.
+        self._v11_key = (
+            None if password is None else
+            pbkdf2_sha1(password, salt=b"pepper",
+                        iterations=1003, key_length=16)
+        )
+        self._cookie_counts = {"v10": 0, "v11": 0, "other": 0}
         self._offset = (32 if meta_version >= 24 else 0)
 
     def derive_key(self, password):
@@ -621,6 +627,16 @@ class MacChromiumCookieDecryptor(ChromiumCookieDecryptor):
                 _log_warning("Unable to decrypt v10 cookies: no key found")
                 return None
             return _decrypt_aes_cbc(ciphertext, self._v10_key, self._offset)
+
+        elif version == b"v11":
+            self._cookie_counts["v11"] += 1
+            if self._v11_key is None:
+                _log_warning("Unable to decrypt v11 cookies: no key found")
+                return None
+            if not ciphertext or len(ciphertext) % 16:
+                _log_warning("Unable to decrypt v11 cookies: invalid length")
+                return None
+            return _decrypt_aes_cbc(ciphertext, self._v11_key, self._offset)
 
         else:
             self._cookie_counts["other"] += 1
@@ -835,9 +851,11 @@ def _get_mac_keyring_password(browser_keyring_name):
             "-s", browser_keyring_name + " Safe Storage",  # match "service"
         )
 
+        if proc.returncode:
+            return None
         if stdout[-1:] == b"\n":
             stdout = stdout[:-1]
-        return stdout
+        return stdout or None
     except Exception as exc:
         _log_warning("Error when using find-generic-password (%s: %s)",
                      exc.__class__.__name__, exc)
